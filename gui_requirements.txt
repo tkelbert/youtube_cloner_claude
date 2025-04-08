@@ -1,0 +1,16 @@
+# Core dependencies from base project
+yt-dlp>=2023.3.4
+pydub>=0.25.1
+numpy>=1.21.0
+tqdm>=4.65.0
+soundfile>=0.12.1
+ffmpeg-python>=0.2.0
+
+# GUI dependencies
+PyQt5>=5.15.0
+
+# Voice cloning (optional)
+torch>=2.0.0
+torchaudio>=2.0.0
+# Install tortoise-tts separately for voice cloning functionality:
+# pip install tortoise-tts

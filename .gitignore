@@ -1,0 +1,21 @@
+# Ignore logs directory
+logs/
+
+# Ignore output directory
+output/
+
+# Ignore Python bytecode and cache directories
+__pycache__/
+*.pyc
+*.pyo
+
+# Ignore the virtual environment directory (if you have one)
+ytmp3_env/
+
+# You can also ignore specific files if needed
+# audio_processor.py
+# cli.py
+# gui.py
+# gui_main.py
+# test_youtube_downloader.py
+# voice_cloner.py
