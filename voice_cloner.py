@@ -160,7 +160,9 @@ class VoiceCloner:
     def create_voice_model(
         self, 
         audio_path: Union[str, Path],
-        model_name: Optional[str] = None
+        model_name: Optional[str] = None,
+        auto_split: bool = False,
+        audio_processor = None
     ) -> VoiceModel:
         """
         Create a voice model from an audio sample.
@@ -169,6 +171,8 @@ class VoiceCloner:
             audio_path: Path to the audio file containing the voice to clone
             model_name: Name for the voice model
                        If None, uses the audio filename
+            auto_split: Whether to automatically split long audio files
+            audio_processor: AudioProcessor instance for splitting (required if auto_split is True)
                        
         Returns:
             VoiceModel: The created voice model
@@ -178,10 +182,26 @@ class VoiceCloner:
         """
         audio_path = Path(audio_path)
         
-        # Validate audio
-        is_valid, reason = self.validate_audio_for_cloning(audio_path)
-        if not is_valid:
-            raise ValueError(f"Invalid audio for voice cloning: {reason}")
+        # Handle long audio by splitting if needed
+        audio_paths = [audio_path]
+        if auto_split:
+            # Validate that we have an audio processor
+            if audio_processor is None:
+                raise ValueError("Audio processor is required for auto-splitting")
+                
+            # Check if the audio is too long
+            try:
+                waveform, sample_rate = torchaudio.load(str(audio_path))
+                duration = waveform.shape[1] / sample_rate
+                
+                if duration > VOICE_SAMPLE_MAX_DURATION:
+                    logger.info(f"Audio is too long ({duration:.1f}s), splitting into segments")
+                    # Split audio into segments
+                    audio_paths = [Path(p) for p in audio_processor.split_audio_for_voice_cloning(audio_path)]
+                    logger.info(f"Split audio into {len(audio_paths)} segments")
+            except Exception as e:
+                logger.warning(f"Failed to check audio duration: {str(e)}")
+                # Continue with single file approach
         
         # Generate model name if not provided
         if model_name is None:
@@ -195,34 +215,61 @@ class VoiceCloner:
         model_path = self.model_dir / f"{model_name}_{int(timestamp)}"
         model_path.mkdir(exist_ok=True, parents=True)
         
-        logger.info(f"Creating voice model '{model_name}' from {audio_path}")
+        logger.info(f"Creating voice model '{model_name}' from {len(audio_paths)} audio segments")
         
         try:
-            # Load audio for processing
-            waveform, sample_rate = torchaudio.load(str(audio_path))
+            # Initialize variables to track the combined audio
+            combined_duration = 0
+            all_source_files = []
             
-            # Convert to mono if needed (average channels)
-            if waveform.shape[0] > 1:
-                waveform = waveform.mean(dim=0, keepdim=True)
+            # Process each audio segment
+            for i, segment_path in enumerate(audio_paths):
+                # Validate each segment
+                is_valid, reason = self.validate_audio_for_cloning(segment_path)
+                if not is_valid:
+                    logger.warning(f"Skipping invalid segment {segment_path}: {reason}")
+                    continue
+                
+                # Load audio for processing
+                waveform, sample_rate = torchaudio.load(str(segment_path))
+                
+                # Convert to mono if needed (average channels)
+                if waveform.shape[0] > 1:
+                    waveform = waveform.mean(dim=0, keepdim=True)
+                
+                # Resample to 22050Hz if needed (Tortoise's expected sample rate)
+                if sample_rate != 22050:
+                    resampler = torchaudio.transforms.Resample(sample_rate, 22050)
+                    waveform = resampler(waveform)
+                    sample_rate = 22050
+                
+                # Calculate duration after resampling
+                duration = waveform.shape[1] / sample_rate
+                combined_duration += duration
+                
+                # For the first segment or if we only have one segment, save it as the main voice
+                if i == 0:
+                    main_voice_path = model_path / "voice.wav"
+                    torchaudio.save(str(main_voice_path), waveform, sample_rate)
+                    logger.info(f"Saved main voice sample: {main_voice_path}")
+                
+                # Save each segment as an additional voice sample for more data
+                sample_path = model_path / f"voice_sample_{i+1:03d}.wav"
+                torchaudio.save(str(sample_path), waveform, sample_rate)
+                logger.info(f"Saved voice sample {i+1}: {sample_path}")
+                
+                # Track source files
+                all_source_files.append(str(segment_path))
             
-            # Resample to 22050Hz if needed (Tortoise's expected sample rate)
-            if sample_rate != 22050:
-                resampler = torchaudio.transforms.Resample(sample_rate, 22050)
-                waveform = resampler(waveform)
-                sample_rate = 22050
-            
-            # Calculate duration after resampling
-            duration = waveform.shape[1] / sample_rate
-            
-            # Save processed audio as WAV for Tortoise
-            processed_path = model_path / "voice.wav"
-            torchaudio.save(str(processed_path), waveform, sample_rate)
+            if combined_duration == 0:
+                raise ValueError("No valid audio segments found for voice cloning")
             
             # Create metadata file with information about the voice
             with open(model_path / "metadata.txt", "w") as f:
-                f.write(f"Source file: {audio_path}\n")
+                f.write(f"Source files: {', '.join(all_source_files)}\n")
                 f.write(f"Created at: {time.ctime(timestamp)}\n")
-                f.write(f"Duration: {duration:.2f} seconds\n")
+                f.write(f"Total duration: {combined_duration:.2f} seconds\n")
+                f.write(f"Number of segments: {len(audio_paths)}\n")
                 f.write(f"Sample rate: {sample_rate} Hz\n")
             
             # Create and return the voice model object
@@ -231,8 +278,8 @@ class VoiceCloner:
                 path=model_path,
                 sample_rate=sample_rate,
                 created_at=timestamp,
-                source_file=str(audio_path),
-                duration=duration
+                source_file=str(audio_path),  # Keep the original file as reference
+                duration=combined_duration
             )
             
             logger.info(f"Voice model created successfully: {model_path}")
@@ -434,6 +481,12 @@ class VoiceCloner:
                 # Load voice sample
                 voice_samples = [load_audio(str(model.path / "voice.wav"), 22050)]
                 
+                # Check for additional voice samples
+                for i in range(1, 10):  # Check for up to 9 additional samples
+                    sample_path = model.path / f"voice_sample_{i:03d}.wav"
+                    if sample_path.exists():
+                        voice_samples.append(load_audio(str(sample_path), 22050))
+                
                 # Set torch seed for reproducibility
                 torch.manual_seed(seed)
                 
@@ -446,10 +499,19 @@ class VoiceCloner:
                     use_deterministic_seed=seed
                 )
                 
+                # Handle the result - could be tensor or ndarray, ensure it's ndarray
+                audio_data = gen_result[0]
+                if isinstance(audio_data, torch.Tensor):
+                    audio_data = audio_data.detach().cpu().numpy()
+                
+                # Ensure audio_data is properly shaped (should be 1D array)
+                if len(audio_data.shape) > 1:
+                    audio_data = audio_data.squeeze()
+                
                 # Save the generated audio
                 torchaudio.save(
                     str(output_path),
-                    torch.from_numpy(gen_result[0][None, :]),
+                    torch.from_numpy(audio_data[None, :]),  # Add batch dimension
                     22050
                 )
                 

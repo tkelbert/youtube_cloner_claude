@@ -307,6 +307,17 @@ class MainWindow(QMainWindow):
         self.model_name_input.setPlaceholderText("Leave blank to use video/file name")
         model_layout.addWidget(self.model_name_input, 0, 1)
         
+        # Auto-split option
+        self.auto_split_check = QCheckBox("Auto-split long audio")
+        self.auto_split_check.setChecked(True)
+        self.auto_split_check.setToolTip("Automatically split audio longer than 10 minutes into segments for better voice cloning")
+        model_layout.addWidget(self.auto_split_check, 1, 0, 1, 2)
+        
+        # Advanced splitting options (initially hidden)
+        self.advanced_split_button = QPushButton("Advanced Split Options...")
+        self.advanced_split_button.clicked.connect(self.show_advanced_split_options)
+        model_layout.addWidget(self.advanced_split_button, 2, 0, 1, 2)
+        
         voice_clone_layout.addWidget(model_group)
         
         # Create voice model button
@@ -735,6 +746,97 @@ class MainWindow(QMainWindow):
         # Create voice model
         self.create_voice_model_from_file(audio_path, model_name)
     
+    def show_advanced_split_options(self):
+        """
+        Show dialog with advanced audio splitting options.
+        """
+        # Create dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Advanced Audio Splitting Options")
+        dialog.setMinimumWidth(400)
+        
+        # Create layout
+        layout = QVBoxLayout(dialog)
+        
+        # Target duration
+        target_layout = QHBoxLayout()
+        target_layout.addWidget(QLabel("Target Segment Duration:"))
+        
+        self.target_duration_spin = QSpinBox()
+        self.target_duration_spin.setMinimum(60)  # 1 minute
+        self.target_duration_spin.setMaximum(600)  # 10 minutes
+        self.target_duration_spin.setValue(300)  # 5 minutes
+        self.target_duration_spin.setSuffix(" seconds")
+        target_layout.addWidget(self.target_duration_spin)
+        
+        layout.addLayout(target_layout)
+        
+        # Overlap
+        overlap_layout = QHBoxLayout()
+        overlap_layout.addWidget(QLabel("Segment Overlap:"))
+        
+        self.overlap_spin = QSpinBox()
+        self.overlap_spin.setMinimum(0)  # No overlap
+        self.overlap_spin.setMaximum(30)  # 30 seconds
+        self.overlap_spin.setValue(5)  # 5 seconds
+        self.overlap_spin.setSuffix(" seconds")
+        overlap_layout.addWidget(self.overlap_spin)
+        
+        layout.addLayout(overlap_layout)
+        
+        # Silence detection
+        self.detect_silence_check = QCheckBox("Split at silent parts when possible")
+        self.detect_silence_check.setChecked(True)
+        layout.addWidget(self.detect_silence_check)
+        
+        # Silence threshold slider
+        threshold_layout = QHBoxLayout()
+        threshold_layout.addWidget(QLabel("Silence Threshold:"))
+        
+        self.silence_threshold_slider = QSlider(Qt.Horizontal)
+        self.silence_threshold_slider.setMinimum(-60)  # Very quiet
+        self.silence_threshold_slider.setMaximum(-20)  # Louder
+        self.silence_threshold_slider.setValue(-40)
+        threshold_layout.addWidget(self.silence_threshold_slider)
+        
+        self.threshold_value_label = QLabel("-40 dB")
+        threshold_layout.addWidget(self.threshold_value_label)
+        
+        # Connect slider to label
+        self.silence_threshold_slider.valueChanged.connect(
+            lambda v: self.threshold_value_label.setText(f"{v} dB")
+        )
+        
+        layout.addLayout(threshold_layout)
+        
+        # Silence length
+        silence_length_layout = QHBoxLayout()
+        silence_length_layout.addWidget(QLabel("Minimum Silence Length:"))
+        
+        self.silence_length_spin = QSpinBox()
+        self.silence_length_spin.setMinimum(200)  # 0.2 seconds
+        self.silence_length_spin.setMaximum(5000)  # 5 seconds
+        self.silence_length_spin.setValue(1000)  # 1 second
+        self.silence_length_spin.setSuffix(" ms")
+        silence_length_layout.addWidget(self.silence_length_spin)
+        
+        layout.addLayout(silence_length_layout)
+        
+        # OK/Cancel buttons
+        button_box = QHBoxLayout()
+        ok_button = QPushButton("OK")
+        ok_button.clicked.connect(dialog.accept)
+        button_box.addWidget(ok_button)
+        
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(dialog.reject)
+        button_box.addWidget(cancel_button)
+        
+        layout.addLayout(button_box)
+        
+        # Show dialog
+        dialog.exec_()
+    
     def create_voice_model_from_file(self, audio_path, model_name):
         """
         Create a voice model from an audio file.
@@ -743,21 +845,42 @@ class MainWindow(QMainWindow):
             audio_path: Path to the audio file
             model_name: Name for the voice model, or None to use filename
         """
-        # Validate audio for voice cloning
-        is_valid, reason = self.voice_cloner.validate_audio_for_cloning(audio_path)
-        if not is_valid:
-            self.show_error(f"Audio not suitable for voice cloning: {reason}")
-            self.create_model_button.setEnabled(True)
-            self.progress_bar.setVisible(False)
-            return
+        # Check if auto-split is enabled
+        auto_split = self.auto_split_check.isChecked()
+        
+        # Skip validation for auto-split, as it will be done per segment
+        if not auto_split:
+            # Validate audio for voice cloning
+            is_valid, reason = self.voice_cloner.validate_audio_for_cloning(audio_path)
+            if not is_valid:
+                self.show_error(f"Audio not suitable for voice cloning: {reason}")
+                self.create_model_button.setEnabled(True)
+                self.progress_bar.setVisible(False)
+                return
+        
+        # Prepare kwargs for advanced splitting options
+        kwargs = {
+            'audio_path': audio_path,
+            'model_name': model_name,
+            'auto_split': auto_split
+        }
+        
+        # Add audio processor if auto-split is enabled
+        if auto_split:
+            kwargs['audio_processor'] = self.audio_processor
         
         # Create worker thread for model creation
         worker = Worker(
             self.voice_cloner.create_voice_model,
-            audio_path,
-            model_name=model_name
+            **kwargs
         )
-        worker.signals.started.connect(lambda: self.status_label.setText("Creating voice model..."))
+        
+        # Connect signals
+        if auto_split:
+            worker.signals.started.connect(lambda: self.status_label.setText("Analyzing and splitting audio..."))
+        else:
+            worker.signals.started.connect(lambda: self.status_label.setText("Creating voice model..."))
+        
         worker.signals.finished.connect(self.task_finished)
         worker.signals.result.connect(self.voice_model_created)
         worker.signals.error.connect(self.task_error)

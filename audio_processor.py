@@ -20,7 +20,8 @@ import soundfile as sf
 
 from config import (DEFAULT_AUDIO_FORMAT, DEFAULT_BITRATE, DEFAULT_CHANNELS,
                    DEFAULT_SAMPLE_RATE, FFMPEG_TIMEOUT, OUTPUT_DIR,
-                   SUPPORTED_AUDIO_FORMATS, TEMP_DIR)
+                   SUPPORTED_AUDIO_FORMATS, TEMP_DIR, VOICE_SAMPLE_MAX_DURATION,
+                   VOICE_SAMPLE_MIN_DURATION)
 
 # Configure module logger
 logger = logging.getLogger(__name__)
@@ -385,3 +386,143 @@ class AudioProcessor:
         except Exception as e:
             logger.error(f"Failed to load audio as array: {str(e)}")
             raise ValueError(f"Failed to load audio as array: {str(e)}")
+    
+    def split_audio_for_voice_cloning(
+        self, 
+        input_file: Union[str, Path],
+        max_duration: float = VOICE_SAMPLE_MAX_DURATION,
+        min_duration: float = VOICE_SAMPLE_MIN_DURATION,
+        target_duration: float = 300.0,  # 5 minutes
+        overlap: float = 5.0,  # 5 seconds of overlap
+        detect_silence: bool = True,
+        silence_threshold: int = -40,  # dB
+        min_silence_length: int = 1000  # ms
+    ) -> List[str]:
+        """
+        Split a long audio file into smaller segments for voice cloning.
+        
+        Args:
+            input_file: Path to the input audio file
+            max_duration: Maximum duration for each segment (seconds)
+            min_duration: Minimum duration for a usable segment (seconds)
+            target_duration: Target duration for segments (seconds)
+            overlap: Overlap between segments (seconds)
+            detect_silence: Whether to try to split at silent parts
+            silence_threshold: Threshold for silence detection (dB)
+            min_silence_length: Minimum silence length to consider (ms)
+            
+        Returns:
+            List[str]: Paths to the split audio segments
+            
+        Raises:
+            ValueError: If input file is invalid or splitting fails
+        """
+        input_file = Path(input_file)
+        
+        if not self.is_valid_audio_file(input_file):
+            raise ValueError(f"Invalid or corrupted input audio file: {input_file}")
+        
+        logger.info(f"Splitting audio file for voice cloning: {input_file}")
+        
+        try:
+            # Load the audio file
+            audio = AudioSegment.from_file(str(input_file))
+            
+            # Get duration in seconds
+            duration = len(audio) / 1000.0
+            
+            # Check if splitting is necessary
+            if duration <= max_duration:
+                logger.info(f"Audio file is already within acceptable length: {duration:.1f}s")
+                return [str(input_file)]
+                
+            logger.info(f"Audio duration: {duration:.1f}s, splitting into segments")
+            
+            # Calculate number of segments needed
+            overlap_ms = int(overlap * 1000)
+            target_duration_ms = int(target_duration * 1000)
+            
+            # Create output directory for segments
+            output_dir = self.output_dir / f"{input_file.stem}_segments"
+            output_dir.mkdir(exist_ok=True, parents=True)
+            
+            segments = []
+            segment_paths = []
+            
+            if detect_silence:
+                # Try to find silent parts for clean splitting
+                logger.info("Detecting silence for intelligent splitting")
+                
+                # Find silent parts
+                silence_ranges = pydub.silence.detect_silence(
+                    audio,
+                    min_silence_len=min_silence_length,
+                    silence_thresh=silence_threshold
+                )
+                
+                if len(silence_ranges) < 2:
+                    logger.warning("Not enough silent parts detected, falling back to time-based splitting")
+                    detect_silence = False
+                else:
+                    logger.info(f"Found {len(silence_ranges)} silent ranges")
+                    
+                    # Use the silent ranges to determine split points
+                    current_start = 0
+                    current_duration = 0
+                    
+                    for silence_start, silence_end in silence_ranges:
+                        # If adding up to this silence would exceed our target, split here
+                        if current_duration + (silence_start - current_start) > target_duration_ms:
+                            # Use the middle of the silence as the split point
+                            split_point = (silence_start + silence_end) // 2
+                            
+                            # Create segment
+                            segment = audio[current_start:split_point]
+                            segment_duration = len(segment) / 1000.0
+                            
+                            # Only keep segments that meet the minimum duration
+                            if segment_duration >= min_duration:
+                                segments.append(segment)
+                                current_start = max(0, split_point - overlap_ms)
+                                current_duration = 0
+                        
+                        current_duration += (silence_end - max(current_start, silence_start))
+                    
+                    # Add the last segment if it's long enough
+                    if len(audio) - current_start >= min_duration * 1000:
+                        segments.append(audio[current_start:])
+            
+            # Fall back to time-based splitting if silence detection didn't work or is disabled
+            if not detect_silence or not segments:
+                logger.info("Using time-based splitting")
+                
+                # Calculate segment length with overlap
+                effective_segment_length = target_duration_ms
+                
+                # Split the audio at regular intervals
+                start_time = 0
+                while start_time < len(audio):
+                    end_time = min(start_time + effective_segment_length, len(audio))
+                    segment = audio[start_time:end_time]
+                    
+                    # Only keep segments that meet the minimum duration
+                    if len(segment) / 1000.0 >= min_duration:
+                        segments.append(segment)
+                    
+                    # Move start time for next segment, considering overlap
+                    start_time = end_time - overlap_ms
+            
+            logger.info(f"Created {len(segments)} segments")
+            
+            # Save segments to files
+            for i, segment in enumerate(segments):
+                segment_path = output_dir / f"{input_file.stem}_segment_{i+1:03d}.wav"
+                segment.export(str(segment_path), format="wav")
+                segment_paths.append(str(segment_path))
+                logger.info(f"Saved segment {i+1}: {segment_path} ({len(segment)/1000.0:.1f}s)")
+            
+            return segment_paths
+            
+        except Exception as e:
+            logger.error(f"Failed to split audio file: {str(e)}")
+            raise ValueError(f"Failed to split audio file: {str(e)}")
